@@ -1,0 +1,7 @@
+.env*
+.git/
+tmp/
+*.log
+data/*.sqlite*
+data/bulk-tax-documents/
+data/uploads/*

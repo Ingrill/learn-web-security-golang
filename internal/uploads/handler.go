@@ -87,7 +87,7 @@ func (handler *Handler) Upload(responseWriter http.ResponseWriter, request *http
 }
 
 func (handler *Handler) Download(responseWriter http.ResponseWriter, request *http.Request) {
-	_, ok := handler.requireAuth(responseWriter, request)
+	current, ok := handler.requireAuth(responseWriter, request)
 	if !ok {
 		return
 	}
@@ -102,6 +102,10 @@ func (handler *Handler) Download(responseWriter http.ResponseWriter, request *ht
 		return
 	}
 	if !found {
+		handler.fileNotFound(responseWriter)
+		return
+	}
+	if current.User.ID != file.UserID && current.User.Role != "support" && current.User.Role != "admin" {
 		handler.fileNotFound(responseWriter)
 		return
 	}
@@ -168,6 +172,9 @@ func (handler *Handler) readUpload(responseWriter http.ResponseWriter, request *
 	files := request.MultipartForm.File["document"]
 	if len(files) == 0 {
 		return nil, "", errors.New("missing document upload")
+	}
+	if len(files) > 1 {
+		return nil, "", errors.New("only one file is permitted per upload")
 	}
 	file, err := files[0].Open()
 	if err != nil {

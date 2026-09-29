@@ -2,17 +2,22 @@ package httpserver
 
 import (
 	"errors"
+	"maps"
 	"net/http"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/bootdotdev/learn-web-security/internal/accounts"
 	"github.com/bootdotdev/learn-web-security/internal/auth/mfa"
 	"github.com/bootdotdev/learn-web-security/internal/auth/passwordreset"
 	"github.com/bootdotdev/learn-web-security/internal/auth/passwords"
+	"github.com/bootdotdev/learn-web-security/internal/auth/returnto"
 	"github.com/bootdotdev/learn-web-security/internal/auth/sessions"
+	"github.com/bootdotdev/learn-web-security/internal/botdetection"
 	"github.com/bootdotdev/learn-web-security/internal/httpx"
 	"github.com/bootdotdev/learn-web-security/internal/logging"
+	"github.com/bootdotdev/learn-web-security/internal/observability"
 	"github.com/bootdotdev/learn-web-security/internal/templates"
 )
 
@@ -27,22 +32,28 @@ type authPage struct {
 }
 
 type authHandler struct {
-	accounts       *accounts.Store
-	renderer       *templates.Renderer
-	logger         *logging.Logger
-	mfa            *mfa.Store
-	passwordResets *passwordreset.Store
-	appOrigin      string
+	accounts          *accounts.Store
+	renderer          *templates.Renderer
+	logger            *logging.Logger
+	trustedProxyHops  int
+	failedLoginAlerts *observability.AuthAlertThreshold
+	resetAlerts       *observability.AuthAlertThreshold
+	mfa               *mfa.Store
+	passwordResets    *passwordreset.Store
+	appOrigin         string
 }
 
-func newAuthHandler(accountStore *accounts.Store, mfaStore *mfa.Store, passwordResetStore *passwordreset.Store, renderer *templates.Renderer, logger *logging.Logger, appOrigin string) *authHandler {
+func newAuthHandler(accountStore *accounts.Store, mfaStore *mfa.Store, passwordResetStore *passwordreset.Store, renderer *templates.Renderer, logger *logging.Logger, appOrigin string, trustedProxyHops int) *authHandler {
 	return &authHandler{
-		accounts:       accountStore,
-		renderer:       renderer,
-		logger:         logger,
-		mfa:            mfaStore,
-		passwordResets: passwordResetStore,
-		appOrigin:      appOrigin,
+		accounts:          accountStore,
+		renderer:          renderer,
+		logger:            logger,
+		trustedProxyHops:  trustedProxyHops,
+		failedLoginAlerts: observability.NewAuthAlertThreshold("failed_logins", 3, 5*time.Minute, logger),
+		resetAlerts:       observability.NewAuthAlertThreshold("password_reset_requests", 3, 10*time.Minute, logger),
+		mfa:               mfaStore,
+		passwordResets:    passwordResetStore,
+		appOrigin:         appOrigin,
 	}
 }
 
@@ -82,16 +93,35 @@ func (handler *authHandler) Login(responseWriter http.ResponseWriter, request *h
 		return
 	}
 	if !found || !passwords.Verify(password, user.PasswordHash) {
+		userID := nullableInt64(user.ID, found)
 		handler.logAuthenticationEvent(request, "login_attempt", map[string]any{
 			"email":         email,
 			"success":       false,
 			"failureReason": loginFailureReason(found),
 			"returnTo":      returnTo,
 		})
+		handler.failedLoginAlerts.Record(
+			requestID(request.Context()).String(),
+			clientIPKeyWithTrustedProxies(handler.trustedProxyHops)(request),
+			userID,
+		)
 		if err := handler.renderLogin(responseWriter, http.StatusUnauthorized, "Invalid email or password", returnTo); err != nil {
 			handler.internalError(responseWriter, request, err)
 		}
 		return
+	}
+
+	if passwords.NeedsRehash(user.PasswordHash) {
+		newHash, err := passwords.Hash(password)
+		if err != nil {
+			handler.internalError(responseWriter, request, err)
+			return
+		}
+		err = handler.accounts.UpdatePasswordHash(request.Context(), user.ID, newHash)
+		if err != nil {
+			handler.internalError(responseWriter, request, err)
+			return
+		}
 	}
 
 	challengeToken := totpLoginChallengeToken(request)
@@ -184,6 +214,10 @@ func (handler *authHandler) Signup(responseWriter http.ResponseWriter, request *
 		handler.internalError(responseWriter, request, err)
 		return
 	}
+	isBot := botdetection.ProtectSignup(responseWriter, request, handler.renderer)
+	if isBot {
+		return
+	}
 	user, err := handler.accounts.CreateCustomer(request.Context(), email, displayName, passwordHash)
 	if err != nil {
 		if errors.Is(err, accounts.ErrEmailExists) {
@@ -210,9 +244,11 @@ func (handler *authHandler) Signup(responseWriter http.ResponseWriter, request *
 	http.Redirect(responseWriter, request, "/account", http.StatusFound)
 }
 
-func parseForm(_ int64, renderer *templates.Renderer) middleware {
+func parseForm(maxBytes int64, renderer *templates.Renderer) middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+			requestCapped := http.MaxBytesReader(responseWriter, request.Body, maxBytes)
+			request.Body = requestCapped
 			if err := request.ParseForm(); err != nil {
 				statusCode := http.StatusBadRequest
 				heading := "Invalid Request"
@@ -237,6 +273,18 @@ func (handler *authHandler) Logout(responseWriter http.ResponseWriter, request *
 	if err := handler.mfa.DeleteChallenge(request.Context(), challengeToken); err != nil {
 		handler.internalError(responseWriter, request, err)
 		return
+	}
+	session, current, err := sessions.Current(request, handler.accounts)
+	if err != nil {
+		handler.internalError(responseWriter, request, err)
+		return
+	}
+	if current == true {
+		err = handler.accounts.RevokeSession(request.Context(), session.Session.Token)
+		if err != nil {
+			handler.internalError(responseWriter, request, err)
+			return
+		}
 	}
 	sessions.ClearCookie(responseWriter)
 	if challengeToken != "" {
@@ -277,15 +325,24 @@ func (handler *authHandler) internalError(responseWriter http.ResponseWriter, re
 	}
 }
 
-func (handler *authHandler) logAuthenticationEvent(_ *http.Request, eventName string, fields map[string]any) {
-	_ = handler.logger.Event(eventName, fields)
+func (handler *authHandler) logAuthenticationEvent(request *http.Request, eventName string, fields map[string]any) {
+	eventFields := make(map[string]any, len(fields)+4)
+	maps.Copy(eventFields, fields)
+	eventFields["requestId"] = requestID(request.Context()).String()
+	eventFields["sourceIp"] = clientIPKeyWithTrustedProxies(handler.trustedProxyHops)(request)
+	eventFields["userId"] = fields["userId"]
+	eventFields["outcome"] = "failure"
+	if success, _ := fields["success"].(bool); success {
+		eventFields["outcome"] = "success"
+	}
+	_ = handler.logger.Event(eventName, eventFields)
 }
 
 func safeReturnTo(value string) string {
 	if value == "" {
 		return "/"
 	}
-	return value
+	return returnto.Safe(value)
 }
 
 func nullableUserID(user accounts.User, found bool) any {

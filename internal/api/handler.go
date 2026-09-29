@@ -34,6 +34,40 @@ type Handler struct {
 	maxProductResults int64
 }
 
+type productResponse struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	ImagePath   string `json:"image_path"`
+	PriceCents  int64  `json:"price_cents"`
+}
+
+type orderResponse struct {
+	ID         int64  `json:"id"`
+	Status     string `json:"status"`
+	TotalCents int64  `json:"total_cents"`
+	CreatedAt  string `json:"created_at"`
+}
+
+func toProductResponse(product storefront.Product) productResponse {
+	return productResponse{
+		ID:          product.ID,
+		Name:        product.Name,
+		Description: product.Description,
+		ImagePath:   product.ImagePath,
+		PriceCents:  product.PriceCents,
+	}
+}
+
+func toOrderResponse(order orders.Order) orderResponse {
+	return orderResponse{
+		ID:         order.ID,
+		Status:     order.Status,
+		TotalCents: order.TotalCents,
+		CreatedAt:  order.CreatedAt,
+	}
+}
+
 func NewHandler(accountStore *accounts.Store, orderStore *orders.Store, productStore *storefront.Store, apiStore *Store, logger *logging.Logger, maxProductResults int) *Handler {
 	return &Handler{
 		accountStore: accountStore, orderStore: orderStore, productStore: productStore, apiStore: apiStore,
@@ -51,11 +85,15 @@ func (handler *Handler) AccountOrders(responseWriter http.ResponseWriter, reques
 		handler.internalError(responseWriter, request, err)
 		return
 	}
-	httpx.RespondWithJSON(responseWriter, http.StatusOK, map[string]any{"orders": orders})
+	var returnOrders []orderResponse
+	for _, order := range orders {
+		returnOrders = append(returnOrders, toOrderResponse(order))
+	}
+	httpx.RespondWithJSON(responseWriter, http.StatusOK, map[string]any{"orders": returnOrders})
 }
 
 func (handler *Handler) Order(responseWriter http.ResponseWriter, request *http.Request) {
-	_, ok := handler.requireAuthentication(responseWriter, request)
+	current, ok := handler.requireAuthentication(responseWriter, request)
 	if !ok {
 		return
 	}
@@ -73,7 +111,12 @@ func (handler *Handler) Order(responseWriter http.ResponseWriter, request *http.
 		httpx.RespondWithJSON(responseWriter, http.StatusNotFound, map[string]string{"error": "Order not found"})
 		return
 	}
-	items, err := handler.orderStore.ListItems(request.Context(), order.ID)
+	if order.UserID != current.User.ID {
+		httpx.RespondWithJSON(responseWriter, http.StatusNotFound, map[string]string{"error": "Order not found"})
+		return
+	}
+	returnOrder := toOrderResponse(order)
+	items, err := handler.orderStore.ListItems(request.Context(), orderID)
 	if err != nil {
 		handler.internalError(responseWriter, request, err)
 		return
@@ -82,19 +125,56 @@ func (handler *Handler) Order(responseWriter http.ResponseWriter, request *http.
 	for _, item := range items {
 		itemResponses = append(itemResponses, orderItemResponse{ProductID: item.ProductID, ProductName: item.ProductName, Quantity: item.Quantity, PriceCents: item.PriceCents})
 	}
-	httpx.RespondWithJSON(responseWriter, http.StatusOK, map[string]any{"order": order, "items": itemResponses})
+	httpx.RespondWithJSON(responseWriter, http.StatusOK, map[string]any{"order": returnOrder, "items": itemResponses})
 }
 
 func (handler *Handler) Products(responseWriter http.ResponseWriter, request *http.Request) {
-	products, err := handler.productStore.ListAllProducts(request.Context())
+	responseWriter.Header().Set("Access-Control-Allow-Origin", "*")
+	products, err := handler.productStore.ListProducts(request.Context(), handler.maxProductResults)
 	if err != nil {
 		handler.internalError(responseWriter, request, err)
 		return
 	}
-	httpx.RespondWithJSON(responseWriter, http.StatusOK, map[string]any{"products": products})
+	var returnProducts []productResponse
+	for _, product := range products {
+		returnProducts = append(returnProducts, toProductResponse(product))
+	}
+	httpx.RespondWithJSON(responseWriter, http.StatusOK, map[string]any{"products": returnProducts})
+}
+
+func (handler *Handler) OptionsProducts(responseWriter http.ResponseWriter, request *http.Request) {
+	responseWriter.Header().Set("Access-Control-Allow-Origin", "*")
+	responseWriter.Header().Set("Access-Control-Allow-Methods", "GET")
+	responseWriter.WriteHeader(http.StatusNoContent)
 }
 
 func (handler *Handler) WarehouseOrders(responseWriter http.ResponseWriter, request *http.Request) {
+	apiKey := request.Header.Get("X-API-Key")
+	foundKey, found, err := handler.apiStore.FindKey(request.Context(), apiKey)
+	if err != nil {
+		handler.internalError(responseWriter, request, err)
+		return
+	}
+
+	if !found {
+		httpx.RespondWithJSON(responseWriter, http.StatusUnauthorized, map[string]string{"error": "key not found"})
+		return
+	}
+	if foundKey.Scope != "orders:read" {
+		httpx.RespondWithJSON(responseWriter, http.StatusForbidden, map[string]string{"error": "unauthorized access"})
+		return
+	}
+	consumedQuota, err := handler.apiStore.ConsumeQuota(request.Context(), foundKey.ID)
+	if err != nil {
+		handler.internalError(responseWriter, request, err)
+		return
+	}
+	SetQuotaHeaders(responseWriter, consumedQuota)
+	quotaResponse := ToQuotaResponse(consumedQuota)
+	if !consumedQuota.Allowed {
+		RespondWithQuotaExhausted(responseWriter, consumedQuota)
+		return
+	}
 	orders, err := handler.orderStore.ListAll(request.Context())
 	if err != nil {
 		handler.internalError(responseWriter, request, err)
@@ -109,6 +189,7 @@ func (handler *Handler) WarehouseOrders(responseWriter http.ResponseWriter, requ
 	httpx.RespondWithJSON(responseWriter, http.StatusOK, map[string]any{
 		"integration": "Warehouse Fulfillment Integration",
 		"orders":      responses,
+		"quota":       quotaResponse,
 	})
 }
 

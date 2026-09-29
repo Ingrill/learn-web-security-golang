@@ -3,9 +3,9 @@ package logging
 import (
 	"encoding/json"
 	"fmt"
-	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 )
@@ -14,6 +14,22 @@ type Logger struct {
 	mutex sync.Mutex
 	file  *os.File
 	now   func() time.Time
+}
+
+var sensitiveFields = []string{
+	"sessionId",
+	"resetToken",
+	"resetLink",
+	"secret",
+	"adminNotes",
+	"storagePath",
+	"email",
+	"shippingName",
+	"shippingAddress",
+	"shippingCity",
+	"shippingRegion",
+	"shippingPostalCode",
+	"originalName",
 }
 
 func Open(filePath string) (*Logger, error) {
@@ -36,7 +52,13 @@ func (logger *Logger) Event(eventName string, fields map[string]any) error {
 		"timestamp": logger.now().UTC().Format("2006-01-02T15:04:05.000Z"),
 		"event":     eventName,
 	}
-	maps.Copy(record, fields)
+	for key, value := range fields {
+		if slices.Contains(sensitiveFields, key) {
+			record[key] = "[REDACTED]"
+		} else {
+			record[key] = value
+		}
+	}
 
 	logger.mutex.Lock()
 	defer logger.mutex.Unlock()

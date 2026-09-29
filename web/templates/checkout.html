@@ -30,7 +30,6 @@
     <h2>Shipping</h2>
     <form method="post" action="/checkout" class="checkout-form">
       <input name="csrfToken" type="hidden" value="{{.CSRFToken}}" />
-      <input name="discountCents" type="hidden" value="0" />
       <label
         >Name<input
           name="shippingName"
@@ -74,6 +73,7 @@
     <p>Check when Acorn Express can deliver your new friend.</p>
     <iframe
       class="shipping-widget"
+      sandbox="allow-scripts"
       src="/shipping-widget.html"
       title="Acorn Express shipping estimate"
     ></iframe>
